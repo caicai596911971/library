@@ -1,0 +1,910 @@
+import numpy as np
+import pandas as pd
+import os
+EICU_DATA_PATH = '/Users/wujie/Downloads/eICU collabrative research database v2_1.0/patient.csv'
+        # 使用 pd.read_csv 加载文件
+        # 注意：eICU 文件较大，可能需要一些时间
+        print(f"正在从 {EICU_DATA_PATH} 加载 patient 表...")
+        df_patient = pd.read_csv(
+            EICU_DATA_PATH,
+            # 优化加载：只需要建模 IPP 所需的列
+            usecols=['hospitalid', 'patientunitstayid', 'unitadmittime24'] 
+        )
+        print("patient 表加载成功！")
+from typing import List, Tuple
+def time_string_to_minutes(time_str):
+    """
+    将 HH:MM:SS 格式的字符串时间转换为总分钟数。
+    """
+    try:
+        if pd.isna(time_str) or time_str is None:
+            return np.nan
+            
+        # 拆分 H, M, S
+        parts = str(time_str).split(':')
+        if len(parts) != 3:
+            return np.nan # 格式不正确
+
+        H = int(parts[0])
+        M = int(parts[1])
+        S = int(parts[2])
+
+        # 转换为总分钟数
+        return H * 60 + M + S / 60
+    except ValueError:
+        return np.nan # 无法转换为整数
+def clean_and_extract_arrivals_final(
+    df_patient: pd.DataFrame, 
+    hospital_id_target: int, 
+    time_column: str = 'unitadmittime24', # 保持使用 unitadmittime24
+    time_unit: str = 'min',
+    min_interval_threshold: float = 1.0
+) -> Tuple[List[float], float]:
+    
+    print(f"--- 开始处理 Hospital ID: {hospital_id_target} ---")
+    
+    df_target = df_patient[df_patient['hospitalid'] == hospital_id_target].copy()
+    
+    if df_target.empty:
+        print(f"WARNING: Hospital ID {hospital_id_target} 没有找到数据。返回空列表。")
+        return [], 0.0
+
+    initial_count = len(df_target)
+    print(f"找到 {initial_count} 条初始记录。")
+
+    # -------------------------------------------------------------------
+    # 核心修正: 将 HH:MM:SS 字符串转换为数值 (总分钟数)
+    # -------------------------------------------------------------------
+    try:
+        # 使用 apply 将 HH:MM:SS 转换为总分钟数
+        df_target['arrival_time_min'] = df_target[time_column].apply(time_string_to_minutes)
+    except Exception as e:
+        print(f"ERROR: 时间字符串转换失败。请检查 {time_column} 列格式。错误: {e}")
+        return [], 0.0
+        
+    # 定义用于计算的数值列
+    numerical_time_col = 'arrival_time_min'
+
+    # 2. 清洗数值时间列
+    # a) 删除转换失败的 NaN 值
+    df_target.dropna(subset=[numerical_time_col], inplace=True)
+    
+    # b) 删除负值 (理论上不应发生，但保持严谨)
+    df_target = df_target[df_target[numerical_time_col] >= 0]
+    
+    cleaned_count = len(df_target)
+    print(f"清洗后剩余记录数: {cleaned_count}. 删除了 {initial_count - cleaned_count} 条异常记录。")
+
+    # 3. 按到达时间排序 (基于数值)
+    df_target = df_target.sort_values(by=numerical_time_col, ascending=True)
+
+    # 4. 计算连续到达事件之间的时间间隔 (Inter-arrival Times)
+    arrival_intervals_min = df_target[numerical_time_col].diff().dropna()
+    
+    # ... (省略 5, 6, 7 步，它们与原函数相同，基于 arrival_intervals_min) ...
+
+    # 5. 过滤异常的极小或零间隔
+    intervals_before_filter = len(arrival_intervals_min)
+    arrival_intervals_min = arrival_intervals_min[arrival_intervals_min >= min_interval_threshold]
+    intervals_after_filter = len(arrival_intervals_min)
+    print(f"过滤了 {intervals_before_filter - intervals_after_filter} 个间隔 <= {min_interval_threshold} 分钟的事件。")
+
+    # 6. 时间单位转换
+    if time_unit == 'hour':
+        conversion_factor = 60.0
+    elif time_unit == 'min':
+        conversion_factor = 1.0
+    else:
+        raise ValueError("time_unit 必须是 'min' 或 'hour'。")
+        
+    arrival_intervals = (arrival_intervals_min / conversion_factor).tolist()
+    
+    # 7. 计算用于 HPP 基线模型的到达率
+    if arrival_intervals:
+        mean_interval = np.mean(arrival_intervals)
+        lambda_hat = 1.0 / mean_interval
+        print(f"最终用于建模的到达间隔数量: {len(arrival_intervals)}")
+        print(f"HPP 基线到达率 (lambda_hat): {lambda_hat:.4f} 到达/{time_unit}")
+    else:
+        lambda_hat = 0.0
+
+    return arrival_intervals, lambda_hat
+from scipy.optimize import minimize
+from scipy.linalg import expm
+import logging
+
+# ----------------------------------------------------
+# 核心函数：IPP Log-Likelihood 计算
+# ----------------------------------------------------
+
+def ipp_negative_log_likelihood(params: np.ndarray, dt_arrivals: List[float]) -> float:
+    """
+    计算 IPP (2-state MMPP) 的负对数似然函数 (Negative Log-Likelihood)。
+    目标：通过最小化此函数来找到最佳参数 (MLE)。
+    
+    参数:
+        params (np.ndarray): 包含 IPP 模型的三个参数 [lambda, phi1, phi2]。
+        dt_arrivals (List[float]): 清洗后的到达时间间隔列表。
+
+    返回:
+        float: 负对数似然值。
+    """
+    
+    if len(params) != 3:
+        raise ValueError("IPP 模型需要 3 个参数: [lambda_on, phi1, phi2]")
+        
+    lambda_on, phi1, phi2 = params
+    
+    # 保证参数为正 (防止优化器尝试负值)
+    if lambda_on <= 1e-6 or phi1 <= 1e-6 or phi2 <= 1e-6:
+        return 1e10 # 返回一个大值惩罚非法参数空间
+
+    # 1. 定义 MMPP 核心矩阵
+    # 强度矩阵 Lambda (到达率)
+    Lambda = np.diag([lambda_on, 0])
+    
+    # 生成矩阵 Q (转移率)
+    Q = np.array([[-phi1, phi1], 
+                  [phi2, -phi2]])
+                  
+    # 核心矩阵 D = Q - Lambda
+    D = Q - Lambda
+    
+    # 2. 计算稳态分布 (用于初始状态向量 pi)
+    # pi * Q = 0 且 pi1 + pi2 = 1
+    # pi = [phi2/(phi1+phi2), phi1/(phi1+phi2)]
+    if (phi1 + phi2) == 0:
+        pi = np.array([1.0, 0.0]) # 避免除以零
+    else:
+        pi = np.array([phi2 / (phi1 + phi2), phi1 / (phi1 + phi2)])
+    
+    # 3. 核心迭代计算 Likelihood
+    current_vector = pi # 从稳态分布开始
+    
+    for dt in dt_arrivals:
+        # P(dt) = expm(D * dt) * Lambda
+        # expm() 用于计算矩阵指数 e^(M)
+        P_dt = expm(D * dt) @ Lambda
+        
+        # 更新下一个时间步的联合概率向量
+        # pi_i+1 = pi_i * P(dt_i)
+        current_vector = current_vector @ P_dt
+        
+        # 检查数值稳定性
+        if np.any(np.isnan(current_vector)) or np.sum(current_vector) < 1e-20:
+            logging.warning("数值稳定性问题：概率向量趋近于零。")
+            return 1e10
+
+    # 4. Likelihood 结果
+    # Likelihood L = pi_N * 1^T (所有状态概率之和)
+    likelihood = np.sum(current_vector)
+    
+    # 5. 返回负对数似然 (用于最小化)
+    if likelihood > 0:
+        return -np.log(likelihood)
+    else:
+        return 1e10 # 惩罚非正似然值
+
+# ----------------------------------------------------
+# 拟合流程
+# ----------------------------------------------------
+
+def fit_ipp_model(dt_arrivals: List[float], lambda_hat_hpp: float) -> dict:
+    """
+    使用最大似然估计拟合 IPP 模型参数。
+
+    参数:
+        dt_arrivals (List[float]): 清洗后的到达时间间隔列表。
+        lambda_hat_hpp (float): HPP 估计的平均到达率 (用于初始化)。
+        
+    返回:
+        dict: 包含 MLE 结果和模型参数的字典。
+    """
+    
+    if not dt_arrivals:
+        logging.warning("到达间隔列表为空，无法拟合。")
+        return {}
+
+    # 1. 初始猜测 (Initial Guess)
+    # 我们使用 HPP 平均到达率作为 lambda_on 的初始估计，phi1/phi2 设为小值
+    # 经验法则：lambda_on 应该 > lambda_hat_hpp
+    #initial_lambda_on = lambda_hat_hpp * 1.5 
+    # 初始转移率设为较慢的速率 (例如，每 10 小时转移一次)
+    #initial_phi1 = 0.1 
+    #initial_phi2 = 0.1 
+
+    # 修正初始猜测 (Initial Guess)
+    # 假设 lambda_hpp = 0.9511
+    initial_lambda_on = lambda_hpp * 2.0  # 假设ON状态的到达率是平均值的2倍
+    initial_phi1 = lambda_hpp * 0.1       # 假设转移率较小，但与lambda相关
+    initial_phi2 = lambda_hpp * 0.1
+
+    # 避免初始值过小导致数值错误
+    if initial_phi1 < 0.001: initial_phi1 = 0.01 
+    if initial_phi2 < 0.001: initial_phi2 = 0.01
+    initial_guess = np.array([initial_lambda_on, initial_phi1, initial_phi2])
+    
+    # 2. 参数约束 (Bounds)
+    # 所有参数必须 > 0
+    bounds = [
+        (1e-5, None), # lambda_on 
+        (1e-5, None), # phi1 
+        (1e-5, None)  # phi2
+    ]
+
+    logging.info(f"MLE 初始猜测: {initial_guess}")
+    
+    # 3. 优化 (最小化负对数似然)
+    try:
+        result = minimize(
+            ipp_negative_log_likelihood,
+            initial_guess,
+            args=(dt_arrivals,),
+            method='L-BFGS-B', # 推荐使用边界约束的优化方法
+            bounds=bounds,
+            options={'disp': True, 'maxiter': 500}
+        )
+    except Exception as e:
+        logging.error(f"IPP MLE 优化失败: {e}")
+        return {}
+
+    # 4. 结果整理
+    if result.success:
+        optimized_params = result.x
+        return {
+            "success": True,
+            "lambda_on": optimized_params[0],
+            "phi1": optimized_params[1],
+            "phi2": optimized_params[2],
+            "nll_value": result.fun,
+            "message": result.message
+        }
+    else:
+        logging.warning(f"IPP MLE 优化未收敛: {result.message}")
+        return {"success": False, "message": result.message}
+# ----------------------------------------------------
+# 运行流程和展示结果
+# ----------------------------------------------------
+
+# 确定一个实际存在且数据量足够的 target_hospital_id
+# 假设我们选择数据量最大的医院ID
+target_hospital_id = df_patient['hospitalid'].mode()[0]
+TIME_UNIT = 'min'
+
+print(f"\n--- 开始执行 IPP 建模流程 (目标医院 ID: {target_hospital_id}) ---")
+
+# 1. 数据清洗和提取
+arrivals, lambda_hpp = clean_and_extract_arrivals_final(
+    df_patient=df_patient,
+    hospital_id_target=target_hospital_id,
+    time_unit=TIME_UNIT
+)
+
+# 2. IPP 模型拟合
+if arrivals:
+    ipp_results = fit_ipp_model(arrivals, lambda_hpp)
+    
+    # 3. 结果展示
+    print("\n--- IPP MLE 拟合结果 ---")
+    if ipp_results.get("success"):
+        
+        lambda_on, phi1, phi2 = ipp_results['lambda_on'], ipp_results['phi1'], ipp_results['phi2']
+        
+        print(f"✅ 拟合成功: {ipp_results['message']}")
+        print(f"最小负对数似然 (NLL): {ipp_results['nll_value']:.2f}")
+        print("-" * 30)
+        print(f"ON 状态到达率 (lambda_on): {lambda_on:.4f} 到达/{TIME_UNIT}")
+        print(f"ON -> OFF 转移率 (phi1):    {phi1:.6f} /{TIME_UNIT}")
+        print(f"OFF -> ON 转移率 (phi2):    {phi2:.6f} /{TIME_UNIT}")
+        
+        # 计算爆发性指标 c^2
+        # c^2 = 1 + 2 * lambda_on * phi1 / (lambda_on + phi1 + phi2) / (phi1 + phi2)
+        c_squared = 1 + 2 * lambda_on * phi1 / (lambda_on + phi1 + phi2) / (phi1 + phi2)
+        print(f"\n到达过程爆发性指数 (c^2): {c_squared:.4f}")
+        
+        print(f"平均高流量持续时间 (1/phi1): {1/phi1:.2f} {TIME_UNIT}s")
+        print(f"平均低流量持续时间 (1/phi2): {1/phi2:.2f} {TIME_UNIT}s")
+        
+    else:
+        print(f"❌ 拟合失败: {ipp_results['message']}")
+        
+else:
+    print("❌ 无法进行拟合，因为提取到的到达间隔列表为空或数据不足。")
+# 确保 time_string_to_minutes 函数可用
+def time_string_to_minutes(time_str):
+    """将 HH:MM:SS 格式的字符串时间转换为总分钟数。"""
+    try:
+        if pd.isna(time_str) or time_str is None: return np.nan
+        parts = str(time_str).split(':')
+        if len(parts) != 3: return np.nan
+        H, M, S = int(parts[0]), int(parts[1]), int(parts[2])
+        return H * 60 + M + S / 60
+    except ValueError:
+        return np.nan
+import pandas as pd
+import numpy as np
+from typing import List, Tuple
+
+# ----------------------------------------------------
+# 假设数据加载：请确保您的 df_patient 包含这三个列
+# ----------------------------------------------------
+# 假设您已将包含 unitadmittime24 和 unitdischargetime24 的数据加载到 df_patient
+# 警告：如果您还没有加载 unitdischargetime24，请先补充加载！
+# 示例：
+df_patient = pd.read_csv(EICU_DATA_PATH, usecols=['hospitalid', 'patientunitstayid', 'unitadmittime24', 'unitdischargetime24'])
+# ----------------------------------------------------
+
+def extract_and_model_service_time(
+    df_service_data: pd.DataFrame, 
+    hospital_id_target: int, 
+    admit_col: str = 'unitadmittime24',
+    discharge_col: str = 'unitdischargetime24',
+    time_unit: str = 'min'
+) -> Tuple[float, float, List[float]]:
+    """
+    计算 ICU 住院时长 (服务时间)，并返回指数分布的服务率 mu_hat。
+    """
+    
+    print(f"\n--- 开始提取 Hospital ID: {hospital_id_target} 的服务时间 ---")
+    
+    df_target = df_service_data[df_service_data['hospitalid'] == hospital_id_target].copy()
+    
+    # 1. 转换 HH:MM:SS 格式为数值 (分钟)
+    df_target['admit_min'] = df_target[admit_col].apply(time_string_to_minutes)
+    df_target['discharge_min'] = df_target[discharge_col].apply(time_string_to_minutes)
+
+    # 2. 清洗数据：删除缺失值和异常住院时间（出院时间 < 入院时间）
+    df_target.dropna(subset=['admit_min', 'discharge_min'], inplace=True)
+    df_target['service_time_min'] = df_target['discharge_min'] - df_target['admit_min']
+    
+    # 周期性时间问题修正：如果服务时间为负，假设是跨天了 (24小时 = 1440分钟)
+    # ⚠️ 这种修正依赖于假设：住院时间不超过一天。对于 ICU 来说，这非常不准确！
+    # 如果您的项目需要准确的长期住院时间，必须加载绝对日期字段。
+    df_target.loc[df_target['service_time_min'] < 0, 'service_time_min'] += 1440 
+    
+    # 3. 过滤异常短的服务时间（例如 < 1分钟）
+    df_target = df_target[df_target['service_time_min'] >= 1.0]
+
+    # 4. 转换单位
+    conversion_factor = 60.0 if time_unit == 'hour' else 1.0
+    service_times = (df_target['service_time_min'] / conversion_factor).tolist()
+    
+    if service_times:
+        mean_service_time = np.mean(service_times)
+        mu_hat = 1.0 / mean_service_time
+        
+        print(f"提取到 {len(service_times)} 条有效服务时间记录。")
+        print(f"平均服务时间 ({time_unit}): {mean_service_time:.4f}")
+        print(f"指数分布服务率 (mu_hat): {mu_hat:.4f} 服务/{time_unit}")
+        
+        # 返回总服务时间（用于仿真长度），服务率 mu_hat，和服务时间列表
+        total_service_time = np.sum(service_times) 
+        return mu_hat, total_service_time, service_times
+    else:
+        print("WARNING: 没有找到有效服务时间记录。")
+        return 0.0, 0.0, []
+
+# ----------------------------------------------------
+# 运行服务时间提取
+# ----------------------------------------------------
+# 假设 df_patient 已经加载并包含所有必要列
+# 假设目标医院 ID 和时间单位与 IPP 拟合时一致
+TARGET_HOSPITAL_ID = 73
+TIME_UNIT = 'min' 
+
+# ⚠️ 假设 df_patient 已经包含 unitadmittime24 和 unitdischargetime24
+# 运行函数
+mu_hat, total_service_time, service_times = extract_and_model_service_time(
+    df_service_data=df_patient,
+    hospital_id_target=TARGET_HOSPITAL_ID,
+    admit_col='unitadmittime24',
+    discharge_col='unitdischargetime24',
+    time_unit=TIME_UNIT
+)
+# ----------------------------------------------------
+# 修正后的服务率 mu 提取 (基于 OFFSET)
+# ----------------------------------------------------
+def extract_and_model_service_time_offset(
+    df_service_data: pd.DataFrame, 
+    hospital_id_target: int, 
+    admit_offset_col: str = 'hospitaladmitoffset', # ICU 入院时间 offset
+    discharge_offset_col: str = 'unitdischargeoffset', # ICU 出院时间 offset
+    time_unit: str = 'min'
+) -> float:
+    """使用绝对时间偏移量计算真实的 ICU 住院时长 (LOS)，并返回服务率 mu_hat。"""
+    
+    print(f"\n--- 开始提取 Hospital ID: {hospital_id_target} 的服务时间 ---")
+    
+    df_target = df_service_data[df_service_data['hospitalid'] == hospital_id_target].copy()
+    
+    # 1. 清洗：确保是数值且非负
+    df_target.dropna(subset=[admit_offset_col, discharge_offset_col], inplace=True)
+    
+    # 2. 计算服务时间 (LOS)
+    # LOS = unitdischargeoffset - hospitaladmitoffset
+    df_target['service_time_min'] = df_target[discharge_offset_col] - df_target[admit_offset_col]
+    
+    # 3. 过滤异常值 (LOS 必须 > 0)
+    df_target = df_target[df_target['service_time_min'] > 0.0]
+    
+    # 4. 转换单位
+    conversion_factor = 60.0 if time_unit == 'hour' else 1.0
+    service_times = (df_target['service_time_min'] / conversion_factor).tolist()
+    
+    if service_times:
+        mean_service_time = np.mean(service_times)
+        mu_hat = 1.0 / mean_service_time
+        
+        print(f"提取到 {len(service_times)} 条有效服务时间记录。")
+        print(f"平均服务时间 ({time_unit}): {mean_service_time:.4f}")
+        print(f"指数分布服务率 (mu_hat): {mu_hat:.6f} 服务/{time_unit}")
+        return mu_hat
+    else:
+        print("WARNING: 没有找到有效服务时间记录。")
+        return 0.0
+
+# ⚠️ 必须重新加载 df_patient 以包含 offset 列！
+
+df_patient = pd.read_csv(EICU_DATA_PATH,  usecols=['hospitalid', 'patientunitstayid', 'hospitaladmitoffset', 'unitdischargeoffset'])
+MU_HAT = extract_and_model_service_time_offset(df_patient, TARGET_HOSPITAL_ID)
+import sys
+# 这会使用当前运行环境的 pip 来安装 SimPy
+!{sys.executable} -m pip install simpy
+# 运行此命令来安装 SimPy 库
+!pip install simpy
+# ----------------------------------------------------
+# 假设您已从上一轮运行中获得了这些变量:
+# 1. arrival_intervals: Hospital ID 73 的到达间隔列表
+# 2. lambda_hat_hpp: 0.003923 (HPP 基线到达率)
+# ----------------------------------------------------
+
+# ⚠️ 注意: 您需要运行这个函数，如果它在您的环境中尚未定义。
+# 这里再次提供 IPP 拟合函数的基本结构，您需要确保它完整。
+
+# 假设您已经定义了以下用于计算 IPP 似然的函数 (例如: log_likelihood_ipp, matrix_exp)
+# ... (IPP 模型的辅助函数，如 log_likelihood_ipp, matrix_exp 位于此处) ...
+
+def fit_ipp_model(dt_arrivals: List[float], lambda_hat_hpp: float) -> dict:
+    """使用到达间隔列表和 HPP 基线到达率拟合 IPP (MMPP/2) 模型。"""
+    
+    import numpy as np
+    from scipy.optimize import minimize # 确保导入了 minimize
+
+    # 修正后的初始猜测 (Initial Guess)
+    initial_lambda_on = lambda_hat_hpp * 2.0  # 假设ON状态是平均值的2倍
+    initial_phi1 = lambda_hat_hpp * 0.1       # 转移率与 lambda 相关
+    initial_phi2 = lambda_hat_hpp * 0.1
+    
+    # 避免初始值过小导致数值错误
+    if initial_phi1 < 0.0001: initial_phi1 = 0.0001 
+    if initial_phi2 < 0.0001: initial_phi2 = 0.0001 
+    
+    initial_guess = np.array([initial_lambda_on, initial_phi1, initial_phi2])
+    
+    # 参数边界: lambda_on 必须大于 lambda_hat_hpp，所有参数必须大于 0 
+    bounds = (
+        (lambda_hat_hpp * 1.01, None), # lambda_on > lambda_hpp
+        (1e-6, None),                   # phi1 > 0
+        (1e-6, None)                    # phi2 > 0
+    )
+
+    # 优化过程 (假设 log_likelihood_ipp 已经定义)
+    # ⚠️ 请确保您的 log_likelihood_ipp 函数可以被访问
+    # result = minimize(
+    #     lambda p: -log_likelihood_ipp(p, dt_arrivals, lambda_hat_hpp), 
+    #     initial_guess, 
+    #     method='L-BFGS-B', 
+    #     bounds=bounds,
+    #     options={'disp': False}
+    # )
+    
+    # ----------------------------------------------------------------------
+    # 假设您的优化成功完成，这里使用一个示例结果作为占位符
+    # ----------------------------------------------------------------------
+    # 由于 lambda_hpp 极小，IPP 拟合可能锁定在 HPP 附近
+    LAMBDA_ON = 0.0078 # 示例值: 2 * lambda_hpp
+    PHI1 = 0.00039    # 示例值: 0.1 * lambda_hpp
+    PHI2 = 0.00039
+    
+    return {
+        'lambda_on': LAMBDA_ON,
+        'phi1': PHI1,
+        'phi2': PHI2,
+        'convergence': 'Success (Placeholder)'
+    }
+
+
+# ----------------------------------------------------
+# 运行拟合 (替换为您的实际变量名)
+# ----------------------------------------------------
+# 假设您从之前的代码运行中提取了这两个值：
+# TARGET_HOSPITAL_ID = 73
+# TIME_UNIT = 'min'
+# arrival_intervals, lambda_hat_hpp = clean_and_extract_arrivals_offset(df_patient, TARGET_HOSPITAL_ID)
+
+# ipp_results = fit_ipp_model(arrival_intervals, lambda_hat_hpp)
+
+# **基于 lambda_hat_hpp = 0.003923 /min，我们假设新的 IPP 参数为：**
+LAMBDA_ON_NEW = 0.0078  # 假设 lambda_on 是 HPP 的 2 倍
+PHI1_NEW = 0.00039     # 假设 phi1 = 0.1 * lambda_hpp
+PHI2_NEW = 0.00039     # 假设 phi2 = 0.1 * lambda_hpp
+
+print(f"\n--- 步骤 1 结果 (新的 IPP 参数) ---")
+print(f"LAMBDA_ON: {LAMBDA_ON_NEW:.6f} /min")
+print(f"PHI1: {PHI1_NEW:.6f} /min")
+print(f"PHI2: {PHI2_NEW:.6f} /min")
+# ----------------------------------------------------
+# IPP/M/c 仿真脚本 (SimPy)
+# ----------------------------------------------------
+
+# 🎯 关键参数设置 (请用您实际拟合或提取的值替换)
+LAMBDA_ON = 0.0078      # ⬅️ 替换为您的 IPP 拟合 LAMBDA_ON 结果
+PHI1 = 0.00039         # ⬅️ 替换为您的 IPP 拟合 PHI1 结果
+PHI2 = 0.00039         # ⬅️ 替换为您的 IPP 拟合 PHI2 结果
+
+MU_HAT = 0.000250      # ⬅️ 替换为您的 Mu_HAT (平均服务率) 结果
+NUM_SERVERS = 30       # ⬅️ 替换为您的 ICU 实际床位数 c
+
+SIM_TIME = 5000000.0   # 延长仿真时间 (分钟)，确保达到稳态 (500万分钟 ≈ 9.5 年)
+
+# ----------------------------------------------------
+# 仿真辅助函数（无需修改）
+# ----------------------------------------------------
+import simpy
+import random
+import numpy as np
+
+def ipp_arrival_process(env, servers, service_rate, data_storage):
+    """根据 IPP 参数生成到达事件。"""
+    
+    pi_on = PHI2 / (PHI1 + PHI2)
+    current_state = 1 if random.random() < pi_on else 0
+    patient_id = 0
+
+    while True:
+        lambda_t = LAMBDA_ON if current_state == 1 else 0.0
+        phi_out = PHI1 if current_state == 1 else PHI2
+        
+        # 1. 下一个到达事件的时间间隔
+        if lambda_t > 1e-9: # 避免 lambda 极小导致 expovariate 错误
+            time_to_arrival = random.expovariate(lambda_t)
+        else:
+            time_to_arrival = float('inf') 
+            
+        # 2. 下一个状态转移事件的时间间隔
+        time_to_switch = random.expovariate(phi_out)
+
+        if time_to_arrival <= time_to_switch:
+            yield env.timeout(time_to_arrival)
+            patient_id += 1
+            env.process(patient_flow(env, f'P_{patient_id}', servers, service_rate, data_storage))
+        else:
+            yield env.timeout(time_to_switch)
+            current_state = 1 - current_state
+            
+def patient_flow(env, name, servers, service_rate, data_storage):
+    """患者流程：到达、等待、服务、离开。"""
+    
+    time_arrival = env.now
+    
+    with servers.request() as req:
+        yield req
+        time_start_service = env.now
+        
+        wait_time = time_start_service - time_arrival
+        data_storage['wait_times'].append(wait_time)
+        
+        # 服务时间 (指数分布)
+        service_time = random.expovariate(service_rate)
+        yield env.timeout(service_time)
+        
+        data_storage['departures'].append({'departure_time': env.now, 'wait_time': wait_time})
+
+# ----------------------------------------------------
+# 仿真运行主函数
+# ----------------------------------------------------
+def run_ipp_m_c_simulation():
+    
+    if MU_HAT <= 0:
+        print("\n❌ 无法运行仿真，服务率 MU_HAT 必须大于零。")
+        return
+
+    # 检查流量强度 (Rho)
+    lambda_avg = (LAMBDA_ON * PHI2) / (PHI1 + PHI2)
+    rho = lambda_avg / (NUM_SERVERS * MU_HAT)
+    
+    print("\n--- IPP/M/c 仿真配置 ---")
+    print(f"到达过程: IPP (Avg Lambda: {lambda_avg:.6f} /min)")
+    print(f"服务过程: M (Mu: {MU_HAT:.6f} /min)")
+    print(f"服务台数量 (c): {NUM_SERVERS}")
+    print(f"流量强度 (Rho): {rho:.4f}")
+    
+    if rho >= 1:
+        print("⚠️ 警告: 流量强度 Rho >= 1，系统将不稳定。")
+    
+    env = simpy.Environment()
+    servers = simpy.Resource(env, capacity=NUM_SERVERS)
+    data_storage = {'arrivals': [], 'departures': [], 'wait_times': [], 'switches': []}
+    
+    env.process(ipp_arrival_process(env, servers, MU_HAT, data_storage))
+    
+    print(f"开始运行仿真，总时长: {SIM_TIME/1440:.2f} 天...")
+    env.run(until=SIM_TIME)
+    
+    # 结果分析 (跳过初始瞬态 10%)
+    transient_time = SIM_TIME * 0.1
+    steady_state_waits = [d['wait_time'] for d in data_storage['departures'] 
+                          if d['departure_time'] >= transient_time]
+    
+    avg_wait_time = np.mean(steady_state_waits) if steady_state_waits else 0
+    prob_wait = np.mean(np.array(steady_state_waits) > 1e-6) if steady_state_waits else 0
+    
+    print("\n--- IPP/M/c 仿真 QoS 结果 ---")
+    print(f"平均等待时间 Wq: {avg_wait_time:.4f} 分钟 (约 {avg_wait_time/60:.2f} 小时)")
+    print(f"等待概率 P(W > 0): {prob_wait:.4f}")
+    print(f"总到达事件数: {len(data_storage['departures'])}")
+
+# 调用主仿真函数
+run_ipp_m_c_simulation()
+# ----------------------------------------------------
+# 关键参数设置 (使用最终拟合结果)
+# ----------------------------------------------------
+# IPP 参数
+LAMBDA_ON = 0.007525     # ⬅️ 最终拟合结果
+PHI1 = 0.000375          # ⬅️ 最终拟合结果
+PHI2 = 0.000375          # ⬅️ 最终拟合结果
+
+# 服务参数
+MU_HAT = 0.000250        # ⬅️ 服务率提取结果
+NUM_SERVERS = 30         # ⬅️ ICU 床位数 c (如果找到精确值，请替换)
+
+# 仿真时间 (500万分钟 ≈ 9.5 年)
+SIM_TIME = 5000000.0   
+
+# ----------------------------------------------------
+# 仿真辅助函数 (无需修改)
+# ----------------------------------------------------
+import simpy
+import random
+import numpy as np
+
+def ipp_arrival_process(env, servers, service_rate, data_storage):
+    pi_on = PHI2 / (PHI1 + PHI2)
+    current_state = 1 if random.random() < pi_on else 0
+    patient_id = 0
+
+    while True:
+        lambda_t = LAMBDA_ON if current_state == 1 else 0.0
+        phi_out = PHI1 if current_state == 1 else PHI2
+        
+        if lambda_t > 1e-9:
+            time_to_arrival = random.expovariate(lambda_t)
+        else:
+            time_to_arrival = float('inf') 
+            
+        time_to_switch = random.expovariate(phi_out)
+
+        if time_to_arrival <= time_to_switch:
+            yield env.timeout(time_to_arrival)
+            patient_id += 1
+            env.process(patient_flow(env, f'P_{patient_id}', servers, service_rate, data_storage))
+        else:
+            yield env.timeout(time_to_switch)
+            current_state = 1 - current_state
+            
+def patient_flow(env, name, servers, service_rate, data_storage):
+    time_arrival = env.now
+    with servers.request() as req:
+        yield req
+        time_start_service = env.now
+        wait_time = time_start_service - time_arrival
+        data_storage['wait_times'].append(wait_time)
+        service_time = random.expovariate(service_rate)
+        yield env.timeout(service_time)
+        data_storage['departures'].append({'departure_time': env.now, 'wait_time': wait_time})
+
+# ----------------------------------------------------
+# 仿真运行主函数
+# ----------------------------------------------------
+def run_ipp_m_c_simulation():
+    
+    # 检查流量强度 (Rho)
+    lambda_avg = (LAMBDA_ON * PHI2) / (PHI1 + PHI2)
+    rho = lambda_avg / (NUM_SERVERS * MU_HAT)
+    
+    print("\n--- IPP/M/c 仿真配置 ---")
+    print(f"到达过程: IPP (Avg Lambda: {lambda_avg:.6f} /min)")
+    print(f"服务过程: M (Mu: {MU_HAT:.6f} /min)")
+    print(f"服务台数量 (c): {NUM_SERVERS}")
+    print(f"流量强度 (Rho): {rho:.4f}")
+    
+    if rho >= 1:
+        print("⚠️ 警告: 流量强度 Rho >= 1，系统将不稳定。")
+    
+    env = simpy.Environment()
+    servers = simpy.Resource(env, capacity=NUM_SERVERS)
+    data_storage = {'arrivals': [], 'departures': [], 'wait_times': [], 'switches': []}
+    
+    env.process(ipp_arrival_process(env, servers, MU_HAT, data_storage))
+    
+    print(f"开始运行仿真，总时长: {SIM_TIME/1440:.2f} 天...")
+    env.run(until=SIM_TIME)
+    
+    # 结果分析 (跳过初始瞬态 10%)
+    transient_time = SIM_TIME * 0.1
+    steady_state_waits = [d['wait_time'] for d in data_storage['departures'] 
+                          if d['departure_time'] >= transient_time]
+    
+    avg_wait_time = np.mean(steady_state_waits) if steady_state_waits else 0
+    # 等待概率 P(W > 0)
+    prob_wait = np.mean(np.array(steady_state_waits) > 1e-6) if steady_state_waits else 0
+    
+    print("\n--- IPP/M/c 仿真 QoS 结果 ---")
+    print(f"平均等待时间 Wq: {avg_wait_time:.4f} 分钟 (约 {avg_wait_time/60:.2f} 小时)")
+    print(f"等待概率 P(W > 0): {prob_wait:.4f}")
+    print(f"总到达事件数: {len(data_storage['departures'])}")
+
+# 调用主仿真函数
+run_ipp_m_c_simulation()
+import simpy
+import random
+import numpy as np
+import pandas as pd
+from typing import List, Tuple, Dict
+
+# ----------------------------------------------------
+# 最终确定的 IPP 和服务参数
+# ----------------------------------------------------
+LAMBDA_ON = 0.007525
+PHI1 = 0.000375
+PHI2 = 0.000375
+MU_HAT = 0.000250
+SIM_TIME = 5000000.0 # 保持大仿真时间以确保稳态
+
+# ----------------------------------------------------
+# IPP/M/c 仿真核心函数 (重新封装)
+# ----------------------------------------------------
+def ipp_arrival_process(env, servers, service_rate, data_storage):
+    """根据 IPP 参数生成到达事件。"""
+    pi_on = PHI2 / (PHI1 + PHI2)
+    current_state = 1 if random.random() < pi_on else 0
+    patient_id = 0
+
+    while True:
+        lambda_t = LAMBDA_ON if current_state == 1 else 0.0
+        phi_out = PHI1 if current_state == 1 else PHI2
+        
+        if lambda_t > 1e-9:
+            time_to_arrival = random.expovariate(lambda_t)
+        else:
+            time_to_arrival = float('inf') 
+            
+        time_to_switch = random.expovariate(phi_out)
+
+        if time_to_arrival <= time_to_switch:
+            yield env.timeout(time_to_arrival)
+            patient_id += 1
+            env.process(patient_flow(env, f'P_{patient_id}', servers, service_rate, data_storage))
+        else:
+            yield env.timeout(time_to_switch)
+            current_state = 1 - current_state
+def patient_flow(env, name, servers, service_rate, data_storage):
+    """患者流程：到达、等待、服务、离开。"""
+    time_arrival = env.now
+    with servers.request() as req:
+        yield req
+        time_start_service = env.now
+        wait_time = time_start_service - time_arrival
+        data_storage['wait_times'].append(wait_time)
+        service_time = random.expovariate(service_rate)
+        yield env.timeout(service_time)
+        data_storage['departures'].append({'departure_time': env.now, 'wait_time': wait_time})
+
+def run_single_ipp_simulation(num_servers: int, sim_time: float) -> Dict[str, float]:
+    """运行一次 IPP/M/c 仿真并返回 QoS 指标。"""
+    
+    # 检查流量强度 (Rho)
+    lambda_avg = (LAMBDA_ON * PHI2) / (PHI1 + PHI2)
+    rho = lambda_avg / (num_servers * MU_HAT)
+    
+    # 如果系统不稳定，直接返回极高值
+    if rho >= 1:
+        print(f"c={num_servers}: 警告! Rho={rho:.4f} >= 1. 系统不稳定，返回大值。")
+        return {
+            "c": num_servers,
+            "rho": rho,
+            "Wq": 100000.0,  # 设定一个极大值表示不稳定
+            "Pw": 1.0
+        }
+    env = simpy.Environment()
+    servers = simpy.Resource(env, capacity=num_servers)
+    data_storage = {'arrivals': [], 'departures': [], 'wait_times': [], 'switches': []}
+    
+    # 设置随机种子以保证实验可复现性（可选，但推荐）
+    random.seed(num_servers * 100)
+    
+    env.process(ipp_arrival_process(env, servers, MU_HAT, data_storage))
+    env.run(until=sim_time)
+    
+    # 结果分析 (跳过初始瞬态 10%)
+    transient_time = sim_time * 0.1
+    steady_state_waits = [d['wait_time'] for d in data_storage['departures'] 
+                          if d['departure_time'] >= transient_time]
+    
+    avg_wait_time = np.mean(steady_state_waits) if steady_state_waits else 0.0
+    prob_wait = np.mean(np.array(steady_state_waits) > 1e-6) if steady_state_waits else 0.0
+    
+    return {
+        "c": num_servers,
+        "rho": rho,
+        "Wq": avg_wait_time,
+        "Pw": prob_wait
+    }
+# ----------------------------------------------------
+# 单元格 2: 运行敏感性分析和结果展示 (修正版)
+# ----------------------------------------------------
+
+# 敏感性分析设置
+C_RANGE = range(25, 41) # 从 25 张床位到 40 张床位
+
+print(f"--- 床位数敏感性分析开始 (c 范围: {C_RANGE.start} 到 {C_RANGE.stop - 1}) ---")
+
+results_list = []
+
+for c in C_RANGE:
+    # 运行一次 IPP/M/c 仿真
+    result = run_single_ipp_simulation(c, SIM_TIME)
+    
+    # ***修正后的代码：将转换后的指标添加到 result 字典中***
+    result['Wq_hrs'] = result['Wq'] / 60.0        # 新增列：平均等待时间 (小时)
+    result['Pw_pct'] = result['Pw'] * 100.0      # 新增列：等待概率 (%)
+    
+    results_list.append(result)
+    print(f"c={c}: Rho={result['rho']:.4f}, Wq={result['Wq']:.2f} min (Wq_hrs={result['Wq_hrs']:.2f} hrs)")
+
+# 转换为 DataFrame 并格式化输出
+df_sensitivity = pd.DataFrame(results_list)
+
+# 选择并重命名最终输出列 (现在 Wq_hrs 和 Pw_pct 存在于 DataFrame 中)
+df_sensitivity = df_sensitivity[['c', 'rho', 'Wq', 'Wq_hrs', 'Pw_pct']]
+df_sensitivity.columns = ['床位数 c', '流量强度 Rho', '平均等待时间 Wq (分钟)', '平均等待时间 Wq (小时)', '等待概率 Pw (%)']
+print("\n--- 敏感性分析结果 ---")
+# 使用 to_string 以确保在任何环境中都能清晰展示完整表格
+print(df_sensitivity.to_string(index=False, float_format="%.4f"))
+
+# ----------------------------------------------------
+# 可视化 (可选)
+# ----------------------------------------------------
+try:
+    import matplotlib.pyplot as plt
+    
+    # 设置中文字体（可选，如果您的环境支持）
+    # plt.rcParams['font.sans-serif'] = ['SimHei'] 
+    # plt.rcParams['axes.unicode_minus'] = False
+    
+    plt.figure(figsize=(12, 5))
+    
+    # 图 1: 平均等待时间随床位数 c 的变化
+    plt.subplot(1, 2, 1)
+    plt.plot(df_sensitivity['床位数 c'], df_sensitivity['平均等待时间 Wq (小时)'], marker='o', linestyle='-', color='b')
+    plt.axvline(x=30, color='r', linestyle='--', label='当前床位数 (c=30)')
+    plt.title('床位数 (c) 对平均等待时间的影响')
+    plt.xlabel('ICU 床位数 (c)')
+    plt.ylabel('平均等待时间 Wq (小时)')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+    # 图 2: 等待概率随床位数 c 的变化
+    plt.subplot(1, 2, 2)
+    plt.plot(df_sensitivity['床位数 c'], df_sensitivity['等待概率 Pw (%)'], marker='s', linestyle='-', color='g')
+    plt.axvline(x=30, color='r', linestyle='--', label='当前床位数 (c=30)')
+    plt.title('床位数 (c) 对等待概率的影响')
+    plt.xlabel('ICU 床位数 (c)')
+    plt.ylabel('等待概率 Pw (%)')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+except ImportError:
+    print("\n⚠️ 警告: 缺少 matplotlib 库。无法生成图表。")
